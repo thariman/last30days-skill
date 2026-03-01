@@ -439,9 +439,60 @@ For `/last30days war in Iran` (NEWS):
 
 ---
 
+## ALWAYS: Generate Timestamped Report Files
+
+**After showing the stats summary and invitation, ALWAYS create report files before waiting for the user.**
+
+This is NOT optional. Every `/last30days` run MUST produce both an MD and PDF report.
+
+**Step 1: Generate the topic slug**
+
+Convert the TOPIC to a lowercase, hyphenated slug:
+- Remove special characters, keep alphanumeric and spaces
+- Replace spaces with hyphens
+- Keep it concise (3-6 words max)
+- Examples: "India AI Summit 2026" -> `india-ai-summit-2026`, "best Claude Code skills" -> `best-claude-code-skills`
+
+**Step 2: Create the Markdown report**
+
+First, create the date subdirectory: `/home/thariman/reports/YYYYMMDD/`
+
+Then write a complete report file to `/home/thariman/reports/YYYYMMDD/HHMM-{slug}.md` where:
+- `YYYYMMDD` = today's date (used as both subdirectory and filename prefix)
+- `HHMM` = current time (24h format, UTC)
+- `{slug}` = the topic slug from Step 1
+
+The MD report must include:
+- Title with topic name
+- Date range and sources used
+- Your full synthesis ("What I learned" section)
+- Key patterns/recommendations
+- The stats block (Reddit/X/YouTube/Web counts)
+- Source URLs for the most important items
+
+**Step 3: Convert to PDF**
+
+Use the existing `md_to_pdf.py` helper (uses xhtml2pdf, no external dependencies):
+
+```bash
+mkdir -p "/home/thariman/reports/YYYYMMDD"
+python3 /home/thariman/reports/md_to_pdf.py \
+  "/home/thariman/reports/YYYYMMDD/HHMM-{slug}.md" \
+  "/home/thariman/reports/YYYYMMDD/HHMM-{slug}.pdf"
+```
+
+**Step 4: Confirm to user**
+
+After creating both files, briefly mention:
+```
+Report saved: ~/reports/YYYYMMDD/HHMM-{slug}.md (.pdf)
+```
+
+---
+
 ## WAIT FOR USER'S RESPONSE
 
-After showing the stats summary with your invitation, **STOP and wait** for the user to respond.
+After showing the stats summary with your invitation and saving the report files, **STOP and wait** for the user to respond.
 
 ---
 

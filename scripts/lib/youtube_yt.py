@@ -426,6 +426,191 @@ def search_and_transcribe(
     return {"items": items}
 
 
+def _search_single_channel(
+    handle: str,
+    dateafter: str,
+    per_channel_limit: int,
+) -> List[Dict[str, Any]]:
+    """Fetch recent videos from a single YouTube channel handle.
+
+    Args:
+        handle: YouTube handle (without @)
+        dateafter: Date in YYYYMMDD format for --dateafter
+        per_channel_limit: Max videos per channel
+
+    Returns:
+        List of video item dicts.
+    """
+    url = f"https://www.youtube.com/@{handle}/videos"
+    cmd = [
+        "yt-dlp",
+        url,
+        "--dump-json",
+        "--no-warnings",
+        "--no-download",
+        f"--dateafter={dateafter}",
+        f"--playlist-end={per_channel_limit}",
+    ]
+
+    preexec = os.setsid if hasattr(os, 'setsid') else None
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=preexec,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            proc.wait(timeout=5)
+            _log(f"Channel @{handle} timed out (60s)")
+            return []
+    except FileNotFoundError:
+        return []
+
+    if not (stdout or "").strip():
+        _log(f"Channel @{handle}: 0 videos")
+        return []
+
+    items = []
+    for line in stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            video = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        video_id = video.get("id", "")
+        view_count = video.get("view_count") or 0
+        like_count = video.get("like_count") or 0
+        comment_count = video.get("comment_count") or 0
+        upload_date = video.get("upload_date", "")  # YYYYMMDD
+
+        # Convert YYYYMMDD to YYYY-MM-DD
+        date_str = None
+        if upload_date and len(upload_date) == 8:
+            date_str = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+
+        items.append({
+            "video_id": video_id,
+            "title": video.get("title", ""),
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "channel_name": video.get("channel", video.get("uploader", handle)),
+            "channel_handle": handle,
+            "date": date_str,
+            "engagement": {
+                "views": view_count,
+                "likes": like_count,
+                "comments": comment_count,
+            },
+            "duration": video.get("duration"),
+            "relevance": 0.8,
+            "why_relevant": f"Recent upload from @{handle}",
+        })
+
+    _log(f"Channel @{handle}: {len(items)} videos")
+    return items
+
+
+def search_channels(
+    handles: List[str],
+    from_date: str,
+    to_date: str,
+    depth: str = "default",
+) -> Dict[str, Any]:
+    """Search YouTube channels by handle, fetching recent uploads.
+
+    Args:
+        handles: List of YouTube handles (without @)
+        from_date: Start date (YYYY-MM-DD)
+        to_date: End date (YYYY-MM-DD)
+        depth: 'quick', 'default', or 'deep'
+
+    Returns:
+        Dict with 'items' list of video metadata dicts.
+    """
+    if not is_ytdlp_installed():
+        return {"items": [], "error": "yt-dlp not installed"}
+
+    per_channel_limits = {"quick": 3, "default": 5, "deep": 10}
+    per_channel_limit = per_channel_limits.get(depth, per_channel_limits["default"])
+
+    # Convert YYYY-MM-DD to YYYYMMDD for --dateafter
+    dateafter = from_date.replace("-", "")
+
+    _log(f"Searching {len(handles)} channels (since {from_date}, limit={per_channel_limit}/ch)")
+
+    all_items = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(
+                _search_single_channel, handle, dateafter, per_channel_limit
+            ): handle
+            for handle in handles
+        }
+        for future in as_completed(futures):
+            handle = futures[future]
+            try:
+                items = future.result()
+                all_items.extend(items)
+            except Exception as e:
+                _log(f"Channel @{handle} error: {e}")
+
+    # Sort by date descending, then views
+    all_items.sort(
+        key=lambda x: (x.get("date") or "0000-00-00", x["engagement"]["views"]),
+        reverse=True,
+    )
+
+    _log(f"Total: {len(all_items)} videos from {len(handles)} channels")
+    return {"items": all_items}
+
+
+def search_channels_and_transcribe(
+    handles: List[str],
+    from_date: str,
+    to_date: str,
+    depth: str = "default",
+) -> Dict[str, Any]:
+    """Search channels and fetch transcripts for top results.
+
+    Args:
+        handles: List of YouTube handles (without @)
+        from_date: Start date (YYYY-MM-DD)
+        to_date: End date (YYYY-MM-DD)
+        depth: 'quick', 'default', or 'deep'
+
+    Returns:
+        Dict with 'items' list. Each item has a 'transcript_snippet' field.
+    """
+    search_result = search_channels(handles, from_date, to_date, depth)
+    items = search_result.get("items", [])
+
+    if not items:
+        return search_result
+
+    # Fetch transcripts for top N by views
+    transcript_limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
+    top_items = sorted(items, key=lambda x: x["engagement"]["views"], reverse=True)
+    top_ids = [item["video_id"] for item in top_items[:transcript_limit]]
+    transcripts = fetch_transcripts_parallel(top_ids)
+
+    for item in items:
+        vid = item["video_id"]
+        item["transcript_snippet"] = transcripts.get(vid, "")
+
+    return {"items": items}
+
+
 def parse_youtube_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Parse YouTube search response to normalized format.
 

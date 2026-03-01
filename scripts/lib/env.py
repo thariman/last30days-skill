@@ -60,6 +60,7 @@ def get_config() -> Dict[str, Any]:
         ('OPENAI_MODEL_PIN', None),
         ('XAI_MODEL_POLICY', 'latest'),
         ('XAI_MODEL_PIN', None),
+        ('REDDIT_PROXY', None),
     ]
 
     config = {}

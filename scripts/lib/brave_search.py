@@ -169,6 +169,95 @@ def _normalize_results(
     return items
 
 
+def search_reddit_via_brave(
+    topic: str,
+    from_date: str,
+    to_date: str,
+    api_key: str,
+    depth: str = "default",
+) -> List[Dict[str, Any]]:
+    """Search Reddit via Brave Search API using site:reddit.com filter.
+
+    Used as a fallback when OpenAI's web_search is rate-limited.
+
+    Returns:
+        List of Reddit item dicts with keys matching openai_reddit schema.
+    """
+    count = {"quick": 10, "default": 20, "deep": 30}.get(depth, 20)
+
+    days = _days_between(from_date, to_date)
+    freshness = _brave_freshness(days)
+
+    params = {
+        "q": f"{topic} site:reddit.com",
+        "count": count,
+        "safesearch": "strict",
+        "text_decorations": 0,
+        "spellcheck": 0,
+    }
+    if freshness:
+        params["freshness"] = freshness
+
+    url = f"{ENDPOINT}?{urlencode(params)}"
+
+    sys.stderr.write(f"[REDDIT] Brave fallback search: {topic}\n")
+    sys.stderr.flush()
+
+    response = http.request(
+        "GET",
+        url,
+        headers={"X-Subscription-Token": api_key},
+        timeout=15,
+    )
+
+    items = []
+    raw_results = (
+        response.get("web", {}).get("results", []) +
+        response.get("news", {}).get("results", [])
+    )
+
+    for i, result in enumerate(raw_results):
+        if not isinstance(result, dict):
+            continue
+
+        result_url = result.get("url", "")
+        if not result_url:
+            continue
+
+        # Only keep reddit.com URLs that point to posts
+        if "reddit.com" not in result_url:
+            continue
+        sub_match = re.search(r'/r/([^/]+)/', result_url)
+        if not sub_match:
+            continue
+        if "/comments/" not in result_url:
+            continue
+
+        subreddit = sub_match.group(1)
+        title = _clean_html(str(result.get("title", "")).strip())
+        snippet = _clean_html(str(result.get("description", "")).strip())
+
+        if not title:
+            continue
+
+        date = _parse_brave_date(result.get("age"), result.get("page_age"))
+
+        items.append({
+            "id": f"BR{i+1}",
+            "title": title[:200],
+            "url": result_url,
+            "subreddit": subreddit,
+            "date": date,
+            "why_relevant": snippet[:300] if snippet else "",
+            "relevance": 0.6,
+        })
+
+    sys.stderr.write(f"[REDDIT] Brave fallback: {len(items)} Reddit results\n")
+    sys.stderr.flush()
+
+    return items
+
+
 def _clean_html(text: str) -> str:
     """Remove HTML tags and decode entities."""
     text = re.sub(r"<[^>]*>", "", text)

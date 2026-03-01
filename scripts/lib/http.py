@@ -2,12 +2,13 @@
 
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
-from urllib.parse import urlencode
+from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlencode, urlparse
 
 DEFAULT_TIMEOUT = 30
 DEBUG = os.environ.get("LAST30DAYS_DEBUG", "").lower() in ("1", "true", "yes")
@@ -21,6 +22,59 @@ def log(msg: str):
 MAX_RETRIES = 5
 RETRY_DELAY = 2.0
 USER_AGENT = "last30days-skill/2.1 (Assistant Skill)"
+
+
+def _parse_proxy_url(proxy_url: str) -> Optional[Tuple[int, str, int, str, str]]:
+    """Parse REDDIT_PROXY env var into (type, host, port, username, password).
+
+    Supports: socks5://user:pass@host:port
+    """
+    try:
+        import socks as _socks_module  # noqa: F811
+    except ImportError:
+        log("PySocks not installed – REDDIT_PROXY ignored")
+        return None
+
+    parsed = urlparse(proxy_url)
+    scheme = parsed.scheme.lower()
+    proxy_types = {
+        "socks5": _socks_module.SOCKS5,
+        "socks4": _socks_module.SOCKS4,
+    }
+    ptype = proxy_types.get(scheme)
+    if ptype is None:
+        log(f"Unsupported proxy scheme: {scheme}")
+        return None
+
+    host = parsed.hostname or ""
+    port = parsed.port or 1080
+    username = parsed.username or ""
+    password = parsed.password or ""
+
+    if not host:
+        log("Proxy URL missing host")
+        return None
+
+    return (ptype, host, port, username, password)
+
+
+def _is_reddit_url(url: str) -> bool:
+    """Check if a URL points to reddit.com."""
+    try:
+        host = urlparse(url).hostname or ""
+        return host == "reddit.com" or host.endswith(".reddit.com")
+    except Exception:
+        return False
+
+
+def _build_proxy_opener(proxy_info: Tuple[int, str, int, str, str]):
+    """Build a urllib opener that routes through a SOCKS proxy."""
+    import socks
+    from sockshandler import SocksiPyHandler
+
+    ptype, host, port, username, password = proxy_info
+    handler = SocksiPyHandler(ptype, host, port, True, username, password)
+    return urllib.request.build_opener(handler)
 
 
 class HTTPError(Exception):
@@ -65,6 +119,17 @@ def request(
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
+    # Use SOCKS proxy for Reddit URLs when REDDIT_PROXY is set
+    proxy_env = os.environ.get("REDDIT_PROXY", "")
+    proxy_opener = None
+    if proxy_env and _is_reddit_url(url):
+        proxy_info = _parse_proxy_url(proxy_env)
+        if proxy_info:
+            proxy_opener = _build_proxy_opener(proxy_info)
+            log(f"Routing through SOCKS proxy: {proxy_info[1]}:{proxy_info[2]}")
+
+    url_open = proxy_opener.open if proxy_opener else urllib.request.urlopen
+
     log(f"{method} {url}")
     if json_data:
         log(f"Payload keys: {list(json_data.keys())}")
@@ -72,7 +137,7 @@ def request(
     last_error = None
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with url_open(req, timeout=timeout) as response:
                 body = response.read().decode('utf-8')
                 log(f"Response: {response.status} ({len(body)} bytes)")
                 return json.loads(body) if body else {}

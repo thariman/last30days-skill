@@ -277,6 +277,62 @@ def _search_x(
     return x_items, raw_response, x_error
 
 
+def _search_x_handles(
+    handles: list,
+    config: dict,
+    selected_models: dict,
+    from_date: str,
+    to_date: str,
+    depth: str,
+    mock: bool,
+    x_source: str = "xai",
+) -> tuple:
+    """Search X for posts from specific handles (runs in thread).
+
+    Batches handles into groups and runs parallel searches, then deduplicates.
+
+    Returns:
+        Tuple of (x_items, raw_response, error)
+    """
+    BATCH_SIZE = 10
+    batches = [handles[i:i + BATCH_SIZE] for i in range(0, len(handles), BATCH_SIZE)]
+
+    all_items = []
+    all_raw = []
+    errors = []
+
+    def _run_batch(batch):
+        query = " OR ".join(f"from:{h}" for h in batch)
+        return _search_x(query, config, selected_models, from_date, to_date, depth, mock, x_source)
+
+    with ThreadPoolExecutor(max_workers=min(len(batches), 3)) as executor:
+        futures = [executor.submit(_run_batch, batch) for batch in batches]
+        for future in futures:
+            try:
+                items, raw, error = future.result(timeout=120)
+                all_items.extend(items)
+                if raw:
+                    all_raw.append(raw)
+                if error:
+                    errors.append(error)
+            except Exception as e:
+                errors.append(f"{type(e).__name__}: {e}")
+
+    # Deduplicate by URL
+    seen_urls = set()
+    deduped = []
+    for item in all_items:
+        url = item.get("url", "")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            deduped.append(item)
+
+    combined_raw = all_raw[0] if len(all_raw) == 1 else {"batches": all_raw}
+    combined_error = "; ".join(errors) if errors and not deduped else None
+
+    return deduped, combined_raw, combined_error
+
+
 def _search_youtube(
     topic: str,
     from_date: str,
@@ -302,6 +358,29 @@ def _search_youtube(
     if response.get("error"):
         youtube_error = response["error"]
 
+    return youtube_items, youtube_error
+
+
+def _search_youtube_channels(
+    handles: list,
+    from_date: str,
+    to_date: str,
+    depth: str,
+) -> tuple:
+    """Search YouTube channels by handle (runs in thread).
+
+    Returns:
+        Tuple of (youtube_items, youtube_error)
+    """
+    try:
+        response = youtube_yt.search_channels_and_transcribe(
+            handles, from_date, to_date, depth=depth,
+        )
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+    youtube_items = youtube_yt.parse_youtube_response(response)
+    youtube_error = response.get("error")
     return youtube_items, youtube_error
 
 
@@ -597,6 +676,7 @@ def run_research(
     run_youtube: bool = False,
     timeouts: dict = None,
     resolved_handle: str = None,
+    channel_handles: list = None,
 ) -> tuple:
     """Run the research pipeline.
 
@@ -630,7 +710,11 @@ def run_research(
     web_error = None
 
     # Determine web search mode
-    do_web = sources in ("all", "web", "reddit-web", "x-web")
+    # In channel mode, skip web — the topic is just a filename, not a useful query
+    if channel_handles:
+        do_web = False
+    else:
+        do_web = sources in ("all", "web", "reddit-web", "x-web")
     web_backend = env.get_web_search_source(config) if do_web else None
     web_needed = do_web and not web_backend
 
@@ -660,7 +744,10 @@ def run_research(
             if progress:
                 progress.start_youtube()
             try:
-                youtube_items, youtube_error = _search_youtube(topic, from_date, to_date, depth)
+                if channel_handles:
+                    youtube_items, youtube_error = _search_youtube_channels(channel_handles, from_date, to_date, depth)
+                else:
+                    youtube_items, youtube_error = _search_youtube(topic, from_date, to_date, depth)
                 if youtube_error and progress:
                     progress.show_error(f"YouTube error: {youtube_error}")
             except Exception as e:
@@ -672,10 +759,20 @@ def run_research(
         return reddit_items, x_items, youtube_items, hackernews_items, polymarket_items, web_items, web_needed, raw_openai, raw_xai, raw_reddit_enriched, reddit_error, x_error, youtube_error, hackernews_error, polymarket_error, web_error
 
     # Determine which searches to run
-    do_reddit = sources in ("both", "reddit", "all", "reddit-web")
-    do_x = sources in ("both", "x", "all", "x-web")
-    do_hackernews = True  # HN is always available (no API key)
-    do_polymarket = True  # Polymarket is always available (no API key)
+    # In channel mode, skip Reddit/HN/Polymarket — handles aren't useful queries
+    # But DO search X using from:handle queries
+    if channel_handles:
+        do_reddit = False
+        do_x = sources in ("both", "x", "all", "x-web") and (
+            config.get("XAI_API_KEY") or x_source == "bird"
+        )
+        do_hackernews = False
+        do_polymarket = False
+    else:
+        do_reddit = sources in ("both", "reddit", "all", "reddit-web")
+        do_x = sources in ("both", "x", "all", "x-web")
+        do_hackernews = True  # HN is always available (no API key)
+        do_polymarket = True  # Polymarket is always available (no API key)
 
     # Run Reddit, X, YouTube, HN, Polymarket, and Web searches in parallel
     reddit_future = None
@@ -699,17 +796,28 @@ def run_research(
         if do_x:
             if progress:
                 progress.start_x()
-            x_future = executor.submit(
-                _search_x, topic, config, selected_models,
-                from_date, to_date, depth, mock, x_source
-            )
+            if channel_handles:
+                x_future = executor.submit(
+                    _search_x_handles, channel_handles, config, selected_models,
+                    from_date, to_date, depth, mock, x_source
+                )
+            else:
+                x_future = executor.submit(
+                    _search_x, topic, config, selected_models,
+                    from_date, to_date, depth, mock, x_source
+                )
 
         if run_youtube:
             if progress:
                 progress.start_youtube()
-            youtube_future = executor.submit(
-                _search_youtube, topic, from_date, to_date, depth
-            )
+            if channel_handles:
+                youtube_future = executor.submit(
+                    _search_youtube_channels, channel_handles, from_date, to_date, depth
+                )
+            else:
+                youtube_future = executor.submit(
+                    _search_youtube, topic, from_date, to_date, depth
+                )
 
         if do_hackernews:
             if progress:
@@ -747,16 +855,33 @@ def run_research(
                 reddit_error = f"{type(e).__name__}: {e}"
                 if progress:
                     progress.show_error(f"Reddit error: {e}")
+            # Brave Search fallback when OpenAI fails or times out
+            if reddit_error and config.get("BRAVE_API_KEY"):
+                try:
+                    sys.stderr.write("[REDDIT] OpenAI failed, falling back to Brave Search...\n")
+                    sys.stderr.flush()
+                    from lib import brave_search
+                    brave_items = brave_search.search_reddit_via_brave(
+                        topic, from_date, to_date,
+                        config["BRAVE_API_KEY"], depth=depth,
+                    )
+                    if brave_items:
+                        reddit_items = brave_items
+                        reddit_error = None
+                except Exception:
+                    pass  # Keep original error
             if progress:
                 progress.end_reddit(len(reddit_items))
 
         if x_future:
+            # Channel mode batches multiple xAI calls — needs more time
+            x_timeout = future_timeout * 3 if channel_handles else future_timeout
             try:
-                x_items, raw_xai, x_error = x_future.result(timeout=future_timeout)
+                x_items, raw_xai, x_error = x_future.result(timeout=x_timeout)
                 if x_error and progress:
                     progress.show_error(f"X error: {x_error}")
             except TimeoutError:
-                x_error = f"X search timed out after {future_timeout}s"
+                x_error = f"X search timed out after {x_timeout}s"
                 if progress:
                     progress.show_error(x_error)
             except Exception as e:
@@ -974,10 +1099,10 @@ def main():
     parser.add_argument(
         "--days",
         type=int,
-        default=30,
+        default=7,
         choices=range(1, 31),
         metavar="N",
-        help="Number of days to look back (1-30, default: 30)",
+        help="Number of days to look back (1-30, default: 7)",
     )
     parser.add_argument(
         "--store",
@@ -1032,6 +1157,10 @@ def main():
     # Load config
     config = env.get_config()
 
+    # Propagate REDDIT_PROXY from .env file to os.environ for http.py
+    if config.get("REDDIT_PROXY") and not os.environ.get("REDDIT_PROXY"):
+        os.environ["REDDIT_PROXY"] = config["REDDIT_PROXY"]
+
     # Auto-detect Bird (no prompts - just use it if available)
     x_source_status = env.get_x_source_status(config)
     x_source = x_source_status["source"]  # 'bird', 'xai', or None
@@ -1065,6 +1194,27 @@ def main():
         print("Error: Please provide a topic to research.", file=sys.stderr)
         print("Usage: python3 last30days.py <topic> [options]", file=sys.stderr)
         sys.exit(1)
+
+    # Detect @file mode: read channel handles from file
+    channel_handles = None
+    if args.topic.startswith("@"):
+        filepath = args.topic[1:]
+        # Try relative to CWD, then absolute
+        if not os.path.isfile(filepath):
+            filepath = os.path.abspath(filepath)
+        if os.path.isfile(filepath):
+            with open(filepath) as f:
+                channel_handles = [
+                    line.strip().lstrip("@")
+                    for line in f if line.strip() and not line.strip().startswith("#")
+                ]
+            if not channel_handles:
+                print(f"Error: No handles found in {filepath}", file=sys.stderr)
+                sys.exit(1)
+            # Use filename (without extension) as display topic
+            args.topic = os.path.splitext(os.path.basename(filepath))[0]
+            sys.stderr.write(f"[channels] Reading {len(channel_handles)} handles from {filepath}\n")
+            sys.stderr.flush()
 
     # Initialize progress display with topic
     progress = ui.ProgressDisplay(args.topic, show_banner=True)
@@ -1172,6 +1322,7 @@ def main():
         run_youtube=has_ytdlp,
         timeouts=timeouts,
         resolved_handle=args.x_handle,
+        channel_handles=channel_handles,
     )
 
     # Processing phase
